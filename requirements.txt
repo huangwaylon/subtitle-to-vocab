@@ -1,9 +1,5 @@
-# nagisa # Removed
 pykakasi
 regex
 requests # For downloading JMdict
-# jamdict
-# PyYAML
-# jisho_api # Removed 
 sudachipy
 sudachidict_core 
