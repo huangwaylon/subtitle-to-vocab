@@ -24,7 +24,7 @@ JMDICT_GZ_FILENAME = "JMdict_e.gz"
 JMDICT_XML_FILENAME = "JMdict_e.xml"
 
 # JLPT Data
-JLPT_DATA_DIR = "yomitan-jlpt-vocab/original_data"
+JLPT_DATA_DIR = "data/jlpt"
 
 # Regex Patterns
 TIMESTAMP_PATTERN = re.compile(r"^\d{2}:\d{2}:\d{2}\.\d{3} --> \d{2}:\d{2}:\d{2}\.\d{3}")
