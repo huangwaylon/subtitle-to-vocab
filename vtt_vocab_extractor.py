@@ -35,6 +35,16 @@ TAG_PATTERN = re.compile(r"<[^>]*>")
 # Parts of speech we're interested in extracting
 TARGET_POS = {'名詞', '動詞', '形容詞', '副詞', '感動詞'}
 
+# Parts of speech to exclude (even if they are a subtype of one of the above)
+EXCLUDE_POS_SUBTYPES = {
+    '助動詞',       # Auxiliary verbs
+    '形状詞',       # Adjectival nouns
+    '助詞',         # Particles
+    '接尾辞',       # Suffixes
+    '接頭辞',       # Prefixes
+    '動詞接尾辞'     # Verb suffixes
+}
+
 
 class DictionaryManager:
     """Handles JMdict dictionary download and parsing."""
@@ -162,6 +172,12 @@ class DictionaryManager:
             return []
         
         return self.kanji_to_readings.get(lemma, [])
+    
+    def exists_in_dictionary(self, word: str) -> bool:
+        """Checks if a word exists in the JMdict dictionary."""
+        if not self.jmdict_data:
+            return False
+        return word in self.jmdict_data
 
 
 class JLPTData:
@@ -213,7 +229,7 @@ class TextProcessor:
         # Initialize SudachiPy Tokenizer
         try:
             self.tokenizer = Dictionary().create()
-            self.sudachi_mode = SplitMode.B  # Mode B for better word segmentation
+            self.sudachi_mode = SplitMode.A  # Mode A for more conservative word segmentation (was Mode B)
         except Exception as e:
             print(f"Error initializing SudachiPy tokenizer: {e}")
             print("Ensure sudachipy and sudachidict_core are installed.")
@@ -262,7 +278,8 @@ class TextProcessor:
     def get_reading(self, text: str) -> str:
         """Generates Hiragana reading for Japanese text using pykakasi."""
         result = self.kakasi.convert(text)
-        return "".join([item.get('hira', '') for item in result]) if result else text
+        reading = "".join([item.get('hira', '') for item in result]) if result else text
+        return reading
     
     def get_context_aware_reading(self, token) -> str:
         """Gets the context-aware reading for a token using SudachiPy."""
@@ -312,6 +329,36 @@ class TextProcessor:
         # For now, just return the first one (most common)
         # In a more sophisticated version, you could implement string similarity comparison
         return hiragana_jmdict_readings[0]
+        
+    def is_grammatical_element(self, token) -> bool:
+        """Determines if a token is a grammatical element rather than a content word."""
+        # Check full part of speech array
+        pos_array = token.part_of_speech()
+        
+        # Check if any subtype is in the exclusion list
+        for pos in pos_array:
+            if pos in EXCLUDE_POS_SUBTYPES:
+                return True
+                
+        # Check for common auxiliary verb endings
+        surface = token.surface()
+        dictionary_form = token.dictionary_form()
+        
+        # Common auxiliary verb endings and particles
+        aux_endings = {'ます', 'です', 'ました', 'でした', 'ない', 'ぬ', 'た', 'だ', 
+                       'く', 'て', 'で', 'る', 'れる', 'らせる', 'させる', 'ちゃう', 'じゃう',
+                       'そう', 'よう', 'っぽい', 'がる'}
+                       
+        # Common particles that might be tokenized independently
+        particles = {'は', 'が', 'を', 'に', 'へ', 'と', 'で', 'から', 'まで', 'より',
+                     'や', 'し', 'ね', 'よ', 'な', 'かな', 'さ', 'わ', 'ぞ', 'ぜ', 'もの',
+                     'って', 'だけ', 'しか', 'ばかり', 'ほど', 'くらい', 'など', 'なんか'}
+        
+        # Check if the surface form or dictionary form matches any exclusion patterns
+        return (surface in aux_endings or 
+                dictionary_form in aux_endings or
+                surface in particles or
+                dictionary_form in particles)
         
         
 class VocabularyExtractor:
@@ -372,55 +419,159 @@ class VocabularyExtractor:
             try:
                 # Tokenize using SudachiPy
                 tokens = self.text_processor.tokenizer.tokenize(sentence, self.text_processor.sudachi_mode)
-
-                for token in tokens:
-                    surface_form = token.surface()
-                    pos = token.part_of_speech()[0]  # Get first element (main POS)
-                    dictionary_form = token.dictionary_form()
-
-                    # Skip if not a target part of speech, not Japanese, or already processed
-                    if (pos not in TARGET_POS or 
-                        not re.search(r'[一-龯ァ-ヶｱ-ﾝﾞﾟ]', dictionary_form) or 
-                        dictionary_form in processed_lemmas_in_sentence):
+                token_list = list(tokens)  # Convert iterator to list for random access
+                
+                skip_indices = set()  # Keep track of indices to skip due to being part of compound words
+                
+                # Process tokens with compound word detection
+                for i in range(len(token_list)):
+                    if i in skip_indices:
                         continue
                     
-                    # Get reading from SudachiPy (context-aware)
-                    sudachi_reading = self.text_processor.get_context_aware_reading(token)
+                    # Check for compound words (looking ahead for valid combinations)
+                    longest_compound = self._find_longest_compound_word(token_list, i, sentence)
                     
-                    # Get possible readings for the dictionary form from JMdict
-                    jmdict_readings = self.dict_manager.get_readings(dictionary_form)
-                    
-                    # Determine the best reading based on context
-                    if jmdict_readings:
-                        # Find the best matching JMdict reading based on the context-aware reading
-                        final_reading = self.text_processor.find_best_reading_match(sudachi_reading, jmdict_readings)
+                    if longest_compound:
+                        # Found a compound word
+                        compound_word, num_tokens, compound_info = longest_compound
+                        
+                        # Mark tokens as part of this compound word so they're not processed individually
+                        for j in range(i, i + num_tokens):
+                            skip_indices.add(j)
+                        
+                        # Add the compound word to vocab items
+                        vocab_items.append(compound_info)
+                        processed_lemmas_in_sentence.add(compound_info["lemma"])
                     else:
-                        # If no JMdict readings, use the SudachiPy reading
-                        final_reading = sudachi_reading
-                    
-                    definition = self.dict_manager.get_definition(dictionary_form, surface_form)
-                    
-                    # Look up JLPT level - try dictionary form first, then surface form
-                    jlpt_level = self.jlpt_data.get_jlpt_level(dictionary_form)
-                    if jlpt_level == "N/A" and dictionary_form != surface_form:
-                        jlpt_level = self.jlpt_data.get_jlpt_level(surface_form)
-                    
-                    vocab_items.append({
-                        "lemma": dictionary_form,
-                        "reading": final_reading,
-                        "pos": pos,
-                        "sentence": sentence,
-                        "definition": definition,
-                        "jlpt": jlpt_level
-                    })
-                    processed_lemmas_in_sentence.add(dictionary_form)
+                        # Process single token as before
+                        token = token_list[i]
+                        surface_form = token.surface()
+                        
+                        # Get main POS and check for excluded grammatical elements
+                        pos = token.part_of_speech()[0]  # Get first element (main POS)
+                        
+                        # Skip if it's a grammatical element (new check)
+                        if self.text_processor.is_grammatical_element(token):
+                            continue
+                            
+                        dictionary_form = token.dictionary_form()
 
+                        # Skip if not a target part of speech, not Japanese, or already processed
+                        if (pos not in TARGET_POS or 
+                            not re.search(r'[一-龯ァ-ヶｱ-ﾝﾞﾟ]', dictionary_form) or 
+                            dictionary_form in processed_lemmas_in_sentence):
+                            continue
+                        
+                        # Get reading from SudachiPy (context-aware)
+                        sudachi_reading = self.text_processor.get_context_aware_reading(token)
+                        
+                        # Get possible readings for the dictionary form from JMdict
+                        jmdict_readings = self.dict_manager.get_readings(dictionary_form)
+                        
+                        # Determine the best reading based on context
+                        if jmdict_readings:
+                            # Find the best matching JMdict reading based on the context-aware reading
+                            final_reading = self.text_processor.find_best_reading_match(sudachi_reading, jmdict_readings)
+                        else:
+                            # If no JMdict readings, use the SudachiPy reading
+                            final_reading = sudachi_reading
+                        
+                        definition = self.dict_manager.get_definition(dictionary_form, surface_form)
+                        
+                        # Look up JLPT level - try dictionary form first, then surface form
+                        jlpt_level = self.jlpt_data.get_jlpt_level(dictionary_form)
+                        if jlpt_level == "N/A" and dictionary_form != surface_form:
+                            jlpt_level = self.jlpt_data.get_jlpt_level(surface_form)
+                        
+                        # Check if definition exists in dictionary (additional validation)
+                        if definition == "N/A (Not found in JMdict)":
+                            # If dictionary form not found, this might be a grammatical element
+                            continue
+                        
+                        vocab_items.append({
+                            "lemma": dictionary_form,
+                            "reading": final_reading,
+                            "pos": pos,
+                            "sentence": sentence,
+                            "definition": definition,
+                            "jlpt": jlpt_level
+                        })
+                        processed_lemmas_in_sentence.add(dictionary_form)
             except Exception as e:
                 print(f"\nError processing sentence with SudachiPy: '{sentence}'. Error: {e}")
                 continue
                 
         print("\nFinished processing sentences.")
         return vocab_items
+    
+    def _find_longest_compound_word(self, tokens, start_idx, sentence):
+        """
+        Find the longest valid compound word starting at the given index.
+        Returns a tuple of (compound_word, num_tokens, compound_info) or None if no valid compound found.
+        """
+        if start_idx >= len(tokens):
+            return None
+            
+        max_lookahead = min(5, len(tokens) - start_idx)  # Look ahead up to 5 tokens or end of sentence
+        
+        # Start with the longest possible compound and work backward
+        for length in range(max_lookahead, 1, -1):  # At least 2 tokens to form a compound
+            # Get surface forms and dictionary forms for the consecutive tokens
+            surface_forms = [tokens[start_idx + j].surface() for j in range(length)]
+            lemmas = [tokens[start_idx + j].dictionary_form() for j in range(length)]
+            
+            # Skip if any token is a grammatical element
+            if any(self.text_processor.is_grammatical_element(tokens[start_idx + j]) for j in range(length)):
+                continue
+            
+            # Try different combinations of surface forms and lemmas
+            candidate_compounds = []
+            
+            # First, try the concatenated surface forms (exactly as they appear in the text)
+            surface_compound = ''.join(surface_forms)
+            candidate_compounds.append((surface_compound, surface_compound))
+            
+            # Next, try the concatenated dictionary forms
+            lemma_compound = ''.join(lemmas)
+            if lemma_compound != surface_compound:
+                candidate_compounds.append((lemma_compound, surface_compound))
+            
+            # Check each candidate in the dictionary
+            for compound_lemma, compound_surface in candidate_compounds:
+                if self.dict_manager.exists_in_dictionary(compound_lemma):
+                    # Get the POS of the first token as an approximation
+                    pos = tokens[start_idx].part_of_speech()[0]
+                    
+                    # Generate reading for the compound
+                    compound_reading = self.text_processor.get_reading(compound_lemma)
+                    
+                    # Get readings from JMdict
+                    jmdict_readings = self.dict_manager.get_readings(compound_lemma)
+                    if jmdict_readings:
+                        compound_reading = self.text_processor.find_best_reading_match(compound_reading, jmdict_readings)
+                    
+                    # Get definition
+                    definition = self.dict_manager.get_definition(compound_lemma, compound_surface)
+                    
+                    # Look up JLPT level
+                    jlpt_level = self.jlpt_data.get_jlpt_level(compound_lemma)
+                    if jlpt_level == "N/A" and compound_lemma != compound_surface:
+                        jlpt_level = self.jlpt_data.get_jlpt_level(compound_surface)
+                    
+                    # Return the compound info
+                    compound_info = {
+                        "lemma": compound_lemma,
+                        "reading": compound_reading,
+                        "pos": pos,
+                        "sentence": sentence,
+                        "definition": definition,
+                        "jlpt": jlpt_level
+                    }
+                    
+                    return (compound_lemma, length, compound_info)
+        
+        # No valid compound found
+        return None
         
     def _process_vocabulary_items(self, vocab_items: List[Dict]) -> List[Dict]:
         """Process and filter vocabulary items."""
@@ -474,6 +625,7 @@ class VocabularyExtractor:
                             'English Definition', 'Original Sentence', 'JLPT Level', 'Frequency']
                 writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
 
+                writer.writeheader()
                 for item in vocab_items:
                     writer.writerow({
                         'Word (Dictionary Form)': item['lemma'],
