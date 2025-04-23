@@ -616,8 +616,6 @@ class VocabularyExtractor:
                     'English Definition', 'Original Sentence', 'JLPT Level', 'Frequency'
                 ]
                 writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-
-                writer.writeheader()
                 for item in vocab_items:
                     writer.writerow({
                         'Word (Dictionary Form)': item['lemma'],
