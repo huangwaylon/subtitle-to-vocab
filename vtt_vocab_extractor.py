@@ -7,7 +7,7 @@ import re
 import csv
 import argparse
 import os
-from collections import Counter
+from collections import Counter, defaultdict
 from typing import Dict, List, Set, Tuple, Optional
 
 import pykakasi
@@ -41,6 +41,7 @@ class DictionaryManager:
     
     def __init__(self):
         self.jmdict_data = None
+        self.kanji_to_readings = None  # New: Maps kanji forms to possible readings
         
     def prepare_dictionary(self) -> bool:
         """Download and extract JMdict if needed, then load it."""
@@ -48,7 +49,7 @@ class DictionaryManager:
             print("Failed to prepare JMdict dictionary file. Cannot proceed.")
             return False
         
-        self.jmdict_data = self._load_jmdict()
+        self.jmdict_data, self.kanji_to_readings = self._load_jmdict()
         return self.jmdict_data is not None
         
     def _download_and_extract_jmdict(self) -> bool:
@@ -83,10 +84,12 @@ class DictionaryManager:
             print(f"Error extracting dictionary: {e}")
             return False
             
-    def _load_jmdict(self) -> Optional[Dict[str, str]]:
-        """Parses the JMdict XML file and loads entries into a dictionary."""
+    def _load_jmdict(self) -> Tuple[Optional[Dict[str, str]], Optional[Dict[str, List[str]]]]:
+        """Parses the JMdict XML file and loads entries into dictionaries."""
         print(f"Loading dictionary from {JMDICT_XML_FILENAME} into memory (this may take a moment)...")
         jmdict_data = {}
+        kanji_to_readings = defaultdict(list)  # New: Will map kanji forms to possible readings
+        
         try:
             # Use iterparse for memory efficiency with large XML files
             context = ET.iterparse(JMDICT_XML_FILENAME, events=('end',))
@@ -96,6 +99,12 @@ class DictionaryManager:
                 if event == 'end' and elem.tag == 'entry':
                     kanji_elements = [k.text for k in elem.findall('k_ele/keb')]
                     reading_elements = [r.text for r in elem.findall('r_ele/reb')]
+                    
+                    # New: Map each kanji form to its possible readings
+                    for kanji in kanji_elements:
+                        for reading in reading_elements:
+                            if reading not in kanji_to_readings[kanji]:
+                                kanji_to_readings[kanji].append(reading)
                     
                     definitions = []
                     sense_elements = elem.findall('sense')
@@ -119,13 +128,14 @@ class DictionaryManager:
                     elem.clear()
                     
             print(f"Dictionary loaded. Found definitions for {len(jmdict_data)} unique forms.")
-            return jmdict_data
+            print(f"Created mappings between {len(kanji_to_readings)} kanji forms and their readings.")
+            return jmdict_data, dict(kanji_to_readings)
         except ET.ParseError as e:
             print(f"Error parsing JMdict XML: {e}")
-            return None
+            return None, None
         except Exception as e:
             print(f"An unexpected error occurred during dictionary loading: {e}")
-            return None
+            return None, None
     
     def get_definition(self, lemma: str, word: str) -> str:
         """Looks up English definition in the pre-loaded JMdict data, trying lemma then original word."""
@@ -145,6 +155,13 @@ class DictionaryManager:
                 
         # 3. If neither is found
         return "N/A (Not found in JMdict)"
+    
+    def get_readings(self, lemma: str) -> List[str]:
+        """Gets possible readings for a lemma from JMdict."""
+        if not self.kanji_to_readings:
+            return []
+        
+        return self.kanji_to_readings.get(lemma, [])
 
 
 class JLPTData:
@@ -247,9 +264,54 @@ class TextProcessor:
         result = self.kakasi.convert(text)
         return "".join([item.get('hira', '') for item in result]) if result else text
     
+    def get_context_aware_reading(self, token) -> str:
+        """Gets the context-aware reading for a token using SudachiPy."""
+        reading = token.reading_form()
+        # Convert katakana to hiragana if needed
+        return self._katakana_to_hiragana(reading)
+    
+    def _katakana_to_hiragana(self, katakana: str) -> str:
+        """Converts katakana to hiragana."""
+        # SudachiPy returns readings in katakana, so we need to convert to hiragana
+        hiragana_start = ord('ぁ')
+        katakana_start = ord('ァ')
+        hiragana = []
+        
+        for char in katakana:
+            if 'ァ' <= char <= 'ヶ':
+                # Convert katakana to hiragana by shifting character codes
+                hiragana_char = chr(ord(char) - katakana_start + hiragana_start)
+                hiragana.append(hiragana_char)
+            else:
+                # Keep non-katakana characters as is
+                hiragana.append(char)
+                
+        return ''.join(hiragana)
+    
     def is_valid_tokenizer(self) -> bool:
         """Check if the tokenizer is available and valid."""
         return self.tokenizer is not None
+        
+    def find_best_reading_match(self, context_reading: str, jmdict_readings: List[str]) -> str:
+        """Find the closest JMdict reading match to the context-aware reading."""
+        if not jmdict_readings:
+            return context_reading
+        
+        # If there's only one reading, return it
+        if len(jmdict_readings) == 1:
+            return self._katakana_to_hiragana(jmdict_readings[0])
+        
+        # Convert all JMdict readings to hiragana for comparison
+        hiragana_jmdict_readings = [self._katakana_to_hiragana(reading) for reading in jmdict_readings]
+        
+        # If context reading is exact match with any JMdict reading, return it
+        if context_reading in hiragana_jmdict_readings:
+            return context_reading
+        
+        # Otherwise, find the most similar reading
+        # For now, just return the first one (most common)
+        # In a more sophisticated version, you could implement string similarity comparison
+        return hiragana_jmdict_readings[0]
         
         
 class VocabularyExtractor:
@@ -321,9 +383,21 @@ class VocabularyExtractor:
                         not re.search(r'[一-龯ァ-ヶｱ-ﾝﾞﾟ]', dictionary_form) or 
                         dictionary_form in processed_lemmas_in_sentence):
                         continue
-                        
-                    # Get reading, definition, and JLPT level
-                    reading = self.text_processor.get_reading(surface_form)
+                    
+                    # Get reading from SudachiPy (context-aware)
+                    sudachi_reading = self.text_processor.get_context_aware_reading(token)
+                    
+                    # Get possible readings for the dictionary form from JMdict
+                    jmdict_readings = self.dict_manager.get_readings(dictionary_form)
+                    
+                    # Determine the best reading based on context
+                    if jmdict_readings:
+                        # Find the best matching JMdict reading based on the context-aware reading
+                        final_reading = self.text_processor.find_best_reading_match(sudachi_reading, jmdict_readings)
+                    else:
+                        # If no JMdict readings, use the SudachiPy reading
+                        final_reading = sudachi_reading
+                    
                     definition = self.dict_manager.get_definition(dictionary_form, surface_form)
                     
                     # Look up JLPT level - try dictionary form first, then surface form
@@ -333,7 +407,7 @@ class VocabularyExtractor:
                     
                     vocab_items.append({
                         "lemma": dictionary_form,
-                        "reading": reading,
+                        "reading": final_reading,
                         "pos": pos,
                         "sentence": sentence,
                         "definition": definition,
